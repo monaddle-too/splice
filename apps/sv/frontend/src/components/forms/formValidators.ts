@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc';
 import { z } from 'zod';
 import type { EffectivityType } from '../../utils/types';
 import { isValidUrl } from '../../utils/validations';
+import { nextScheduledSynchronizerUpgradeFormat } from '@canton-network/splice-common-frontend-utils';
+
+dayjs.extend(utc);
 
 export const urlSchema = z.string().refine(url => isValidUrl(url), {
   message: 'Invalid URL',
@@ -267,5 +271,102 @@ export const validateNextScheduledLogicalSynchronizerUpgrade = (
     return 'Upgrade Time must be after Topology Freeze Time';
   }
 
+  return false;
+};
+
+export type SwitchOverEntry = { key: string; time: string };
+
+/**
+ * Serialize switch-over entries into the DAML map shape used by the config
+ * builders: trim keys, drop entries with an empty key, normalize each time to
+ * the DAML `Time` format, and collapse to `null` when there is nothing left.
+ * Shared with the builders so change detection matches what is submitted.
+ */
+export const serializeSwitchOverTimes = (
+  entries: SwitchOverEntry[]
+): Record<string, string> | null => {
+  const trimmed = entries.map(e => ({ key: e.key.trim(), time: e.time })).filter(e => e.key !== '');
+
+  return trimmed.length === 0
+    ? null
+    : Object.fromEntries(
+        trimmed.map(e => [
+          e.key,
+          dayjs(e.time).utc().format(nextScheduledSynchronizerUpgradeFormat),
+        ])
+      );
+};
+
+/**
+ * Canonical string form of switch-over entries, used as the value of the
+ * `svOperationsSwitchOverTimes` / `amuletSwitchOverTimes` config field so the
+ * map flows through the normal ConfigChange change-detection pipeline. Keys are
+ * sorted so the string is stable regardless of entry order; empty maps become
+ * the empty string (i.e. "no change" relative to an unset field).
+ */
+export const switchOverEntriesToConfigValue = (entries: SwitchOverEntry[]): string => {
+  const normalized = serializeSwitchOverTimes(entries) ?? {};
+  const sorted = Object.fromEntries(
+    Object.entries(normalized).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  );
+  return Object.keys(sorted).length === 0 ? '' : JSON.stringify(sorted);
+};
+
+/**
+ * Same canonical string as {@link switchOverEntriesToConfigValue}, but derived
+ * from a baseline DAML switch-over map (as read off a config). Normalizing both
+ * sides through the same path keeps the baseline/current comparison format-safe.
+ */
+export const switchOverMapToConfigValue = (
+  map: Record<string, string> | null | undefined
+): string =>
+  switchOverEntriesToConfigValue(Object.entries(map ?? {}).map(([key, time]) => ({ key, time })));
+
+/**
+ * Inverse of {@link switchOverEntriesToConfigValue}: parse the config field
+ * value back into a DAML switch-over map (or `null` when empty).
+ */
+export const configValueToSwitchOverMap = (
+  value: string | null | undefined
+): Record<string, string> | null => {
+  if (!value) return null;
+  const parsed = JSON.parse(value) as Record<string, string>;
+  return Object.keys(parsed).length === 0 ? null : parsed;
+};
+
+export const validateSwitchOverTimes = (
+  entries: SwitchOverEntry[],
+  allowNonFutureDated: boolean,
+  effectiveDate: string | undefined
+): string | false => {
+  if (entries.length === 0) return false;
+
+  const keys = entries.map(e => e.key.trim());
+
+  if (keys.some(k => k === '')) {
+    return 'Switch-over key is required';
+  }
+
+  if (new Set(keys).size !== keys.length) {
+    return 'Switch-over keys must be unique';
+  }
+
+  for (const { key, time } of entries) {
+    // Times are stored as local wall-clock strings (dateTimeFormatISO), matching the
+    // DateField picker and the effective date; parse them in the same (local) frame.
+    // The builder converts to a UTC DAML Time on submit.
+    const t = dayjs(time);
+    if (!t.isValid()) {
+      return `Invalid time for switch-over "${key.trim()}"`;
+    }
+    // Skip the ">= 1 day after effectivity" check at threshold (no effective date)
+    // or when the operator has opted into non-future-dated times.
+    if (!allowNonFutureDated && effectiveDate) {
+      const minTime = dayjs(effectiveDate).add(1, 'day');
+      if (t.isBefore(minTime)) {
+        return `Switch-over "${key.trim()}" must be at least 1 day after the Effective Date`;
+      }
+    }
+  }
   return false;
 };
